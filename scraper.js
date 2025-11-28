@@ -11,12 +11,23 @@ require('dotenv').config();
 // ============================================================================
 
 // Nitter instances to try (priority order)
+// Updated from: https://github.com/zedeus/nitter/wiki/Instances
 const NITTER_INSTANCES = [
-  'nitter.net',            // Original, currently working
-  'xcancel.com',
-  'nitter.poast.org',
+  // Tier 1: Most reliable (working as of Nov 2024)
+  'nitter.catsarch.com',       // Working reliably
+  'xcancel.com',               // Official wiki listed
+  'nitter.poast.org',          // Noted as working well
+
+  // Tier 2: Official and community instances
+  'nitter.net',                // Official instance
+  'nitter.privacyredirect.com', // Official wiki  
+  'lightbrd.com',              // Cloudflare backed
+  'nitter.tiekoetter.com',     // Community instance
+  'nuku.trabun.org',           // Community instance
+  'nitter.space',              // Cloudflare backed
+
+  // Tier 3: Additional backups
   'nitter.privacydev.net',
-  'nitter.catsarch.com',
   'nitter.woodland.cafe',
   'nitter.in.projectsegfau.lt',
   'nitter.1d4.us',
