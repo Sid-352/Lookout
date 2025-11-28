@@ -1,3 +1,0 @@
-ntscraper
-requests
-python-dotenv
