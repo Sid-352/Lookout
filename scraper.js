@@ -1,145 +1,293 @@
-// Library Import
+// Lookout v2.1 - Nitter Scraper with Playwright
 const { chromium } = require('playwright');
 const { WebhookClient, EmbedBuilder } = require('discord.js');
 const fs = require('fs').promises;
 const path = require('path');
+const { getCachedHealthyInstances } = require('./healthChecker');
 require('dotenv').config();
 
-// Send data to Discord via Webhook
+// ============================================================================
+// CONFIGURATION  
+// ============================================================================
+
+// Nitter instances to try (priority order)
+const NITTER_INSTANCES = [
+  'nitter.net',            // Original, currently working
+  'xcancel.com',
+  'nitter.poast.org',
+  'nitter.privacydev.net',
+  'nitter.catsarch.com',
+  'nitter.woodland.cafe',
+  'nitter.in.projectsegfau.lt',
+  'nitter.1d4.us',
+  'nitter.moomoo.me',
+  'nitter.eu.projectsegfau.lt',
+  'nitter.projectsegfau.lt',
+  'nitter.fdn.fr',
+  'nitter.ktachibana.party',
+  'nitter.pw'
+];
+
+const PLAYWRIGHT_TIMEOUT = 30000;  // 30 seconds
+const HEALTH_CHECK_COUNT = 3;      // Check top 3 instances
+
+// ============================================================================
+// SCRAPING FUNCTION
+// ============================================================================
+
+async function scrapeNitterInstance(instance, handle) {
+  console.log(`\n🔍 Trying ${instance}...`);
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  });
+
+  try {
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    });
+
+    const page = await context.newPage();
+    const url = `https://${instance}/${handle}`;
+
+    console.log(`   Navigating to ${url}...`);
+    await page.goto(url, {
+      timeout: PLAYWRIGHT_TIMEOUT,
+      waitUntil: 'networkidle'
+    });
+
+    // Wait a moment for dynamic content
+    await page.waitForTimeout(2000);
+
+    console.log(`   Looking for tweets...`);
+
+    // Find all tweet status links
+    const statusLinks = await page.$$eval('a[href*="/status/"]', links =>
+      links.map(link => link.href || link.getAttribute('href'))
+    );
+
+    if (statusLinks.length === 0) {
+      throw new Error('No tweet links found on page');
+    }
+
+    console.log(`   Found ${statusLinks.length} tweet links`);
+
+    // Get first tweet URL (skip checking for pinned - just get the latest)
+    // We'll handle pinned tweets by checking the URL against our log
+    const firstTweetLink = statusLinks[0];
+    const tweetUrl = firstTweetLink.startsWith('http')
+      ? firstTweetLink
+      : `https://twitter.com${firstTweetLink}`;
+
+    console.log(`   Latest tweet: ${tweetUrl}`);
+
+    // Extract author info from page
+    const authorName = await page.$eval(
+      'a.fullname, .fullname',
+      el => el.textContent.trim()
+    ).catch(() => 'Unknown');
+
+    const authorHandle = await page.$eval(
+      'a.username, .username',
+      el => el.textContent.trim()
+    ).catch(() => '@unknown');
+
+    // Get profile pic
+    const profilePicUrl = await page.$eval(
+      'img.avatar, .avatar img',
+      el => el.src || el.getAttribute('src')
+    ).catch(() => '');
+
+    // Get tweet text (first one on page)
+    const tweetText = await page.$eval(
+      '.tweet-content',
+      el => el.textContent.trim()
+    ).catch(() => 'Tweet content unavailable');
+
+    // Get timestamp (use current time if Nitter doesn't provide valid one)
+    let timestamp = new Date().toISOString();
+    try {
+      const timeAttr = await page.$eval(
+        '.tweet-date a, a[title]',
+        el => el.getAttribute('title')
+      );
+      // Validate it's a real date before using it
+      if (timeAttr && !isNaN(Date.parse(timeAttr))) {
+        timestamp = timeAttr;
+      }
+    } catch (e) {
+      // Use default current time
+    }
+
+    // Get image if present
+    const tweetImageUrl = await page.$eval(
+      '.still-image, .attachment img',
+      el => el.src || el.getAttribute('src')
+    ).catch(() => null);
+
+    // Fix relative URLs for profile pic and images
+    const fixedProfilePic = profilePicUrl && profilePicUrl.startsWith('/')
+      ? `https://${instance}${profilePicUrl}`
+      : profilePicUrl;
+
+    const fixedImageUrl = tweetImageUrl && tweetImageUrl.startsWith('/')
+      ? `https://${instance}${tweetImageUrl}`
+      : tweetImageUrl;
+
+    console.log(`✅ Successfully scraped from ${instance}!`);
+
+    return {
+      tweetUrl,
+      authorName,
+      authorHandle,
+      tweetText,
+      timestamp,
+      profilePicUrl: fixedProfilePic,
+      tweetImageUrl: fixedImageUrl,
+      handle,
+      nitterInstance: instance
+    };
+
+  } finally {
+    await browser.close();
+  }
+}
+
+// ============================================================================
+// INSTANCE SELECTION & FALLBACK
+// ============================================================================
+
+async function fetchLatestTweet(handle) {
+  // Get healthy instances
+  const healthyInstances = await getCachedHealthyInstances(NITTER_INSTANCES, HEALTH_CHECK_COUNT);
+
+  // Prioritize healthy instances, then try all
+  const healthyDomains = healthyInstances.map(h => h.instance);
+  const fallbackInstances = NITTER_INSTANCES.filter(i => !healthyDomains.includes(i));
+  const instancesToTry = [...healthyDomains, ...fallbackInstances];
+
+  console.log(`\n🎯 Will try ${instancesToTry.length} instances (${healthyDomains.length} pre-checked healthy)\n`);
+
+  let lastError = null;
+
+  for (const instance of instancesToTry) {
+    try {
+      const tweetData = await scrapeNitterInstance(instance, handle);
+      return tweetData;
+    } catch (error) {
+      console.log(`   ❌ ${instance} failed: ${error.message}`);
+      lastError = error;
+    }
+  }
+
+  throw new Error(`All ${instancesToTry.length} Nitter instances failed. Last error: ${lastError?.message}`);
+}
+
+// ============================================================================
+// DISCORD WEBHOOK
+// ============================================================================
+
 async function sendToDiscord(tweetData) {
   const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
   if (!webhookUrl) {
     console.error('Error: DISCORD_WEBHOOK_URL is not set in the .env file.');
     return;
   }
-  // Declaration of the webhook
+
   const webhookClient = new WebhookClient({ url: webhookUrl });
   const embed = new EmbedBuilder()
     .setColor(0x1DA1F2)
-    .setAuthor({ 
-      name: `${tweetData.authorName} • ${tweetData.authorHandle}`, 
-      iconURL: tweetData.profilePicUrl, 
-      url: tweetData.tweetUrl 
+    .setAuthor({
+      name: `${tweetData.authorName} • ${tweetData.authorHandle}`,
+      iconURL: tweetData.profilePicUrl,
+      url: tweetData.tweetUrl
     })
     .setDescription(tweetData.tweetText)
-    .setTimestamp(new Date(tweetData.tweetTimestamp))
-    .setFooter({ text: '𝕏' });
+    .setTimestamp(new Date(tweetData.timestamp))
+    .setFooter({ text: `🔭 Lookout via ${tweetData.nitterInstance}` });
+
   if (tweetData.tweetImageUrl) {
     embed.setImage(tweetData.tweetImageUrl);
   }
-  console.log(`Sending tweet from @${tweetData.handle} to Discord...`);
+
+  console.log(`\n📤 Sending tweet from @${tweetData.handle} to Discord...`);
   try {
     await webhookClient.send({
-      username: 'Twitter Updates',
+      username: 'Lookout',
       avatarURL: tweetData.profilePicUrl,
       embeds: [embed],
     });
-    console.log('Successfully sent to Discord!');
+    console.log('✅ Successfully sent to Discord!');
   } catch (error) {
-    console.error('Error sending to Discord:', error);
+    console.error('❌ Error sending to Discord:', error.message);
     throw error;
   }
 }
 
+// ============================================================================
+// MAIN
+// ============================================================================
+
 async function main() {
   const handle = process.argv[2];
   if (!handle) {
-    console.error('Error: No Twitter handle provided. Usage: node scraper.js <handle>');
+    console.error('❌ Error: No Twitter handle provided. Usage: node scraper.js <handle>');
     return;
   }
-  console.log(`Starting scraper for handle: @${handle}`);
-  const logFilePath = path.join(__dirname, 'log', `${handle}_last_tweet.txt`);
-  const targetUrl = `https://x.com/${handle}`;
 
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`🔭 LOOKOUT v2.1 - Monitoring @${handle}`);
+  console.log(`${'='.repeat(60)}\n`);
+
+  const logFilePath = path.join(__dirname, 'log', `${handle}_last_tweet.txt`);
+
+  // Read last posted tweet URL
   let lastPostedUrl = '';
   try {
     lastPostedUrl = await fs.readFile(logFilePath, 'utf-8');
-    console.log(`Found last posted URL for @${handle}: ${lastPostedUrl}`);
+    console.log(`📝 Last posted URL: ${lastPostedUrl}`);
   } catch (error) {
-    console.log(`Log file for @${handle} not found. This is the first run for this handle.`);
+    console.log('📝 No previous log found. This is the first run.');
   }
-
-  const authToken = process.env.AUTH_TOKEN;
-  if (!authToken) {
-    console.error('Error: AUTH_TOKEN is not set in the .env file.');
-    return;
-  }
-
-  console.log('Launching browser...');
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
-  });
-  const cookies = [{ name: 'auth_token', value: authToken, domain: '.x.com', path: '/', httpOnly: true, secure: true }];
-  await context.addCookies(cookies);
-  const page = await context.newPage();
-  await page.setViewportSize({ width: 1920, height: 1080 });
 
   try {
-    let connected = false;
-    for (let i = 0; i < 3; i++) {
-      try {
-        console.log(`Navigating to ${targetUrl} (Attempt ${i + 1})...`);
-        await page.goto(targetUrl, { timeout: 60000 });
-        connected = true;
-        break;
-      } catch (error) {
-        if (error.message.includes('net::ERR_CONNECTION_RESET') && i < 2) {
-          console.warn('Connection reset, retrying in 5 seconds...');
-          await new Promise(resolve => setTimeout(resolve, 5000));
-        } else {
-          throw error;
-        }
-      }
-    }
-    if (!connected) {
-      console.error("Failed to connect after multiple retries.");
-      return;
-    }
-    
-    await page.locator('main[role="main"]').waitFor();
-    console.log('Scraping the latest tweet...');
-    const latestTweet = page.locator('article[data-testid="tweet"]:not(:has-text("Pinned"))').first();
-    
-    const tweetUrl = `https://x.com${await latestTweet.locator('time').first().locator('..').getAttribute('href')}`;
+    // Fetch latest tweet from Nitter
+    const tweetData = await fetchLatestTweet(handle);
 
-    if (tweetUrl === lastPostedUrl) {
-      console.log('No new tweet found. Exiting.');
+    // Check if it's a new tweet
+    if (tweetData.tweetUrl === lastPostedUrl) {
+      console.log('\n✓ No new tweet found. Exiting.');
       return;
     }
-// Definition of the webhook
-    const tweetData = {
-        handle: handle,
-        authorName: (await latestTweet.locator('[data-testid="User-Name"] span').first().textContent() || '').trim(),
-        authorHandle: (await latestTweet.locator('[data-testid="User-Name"] span:has-text("@")').first().textContent() || '').trim(),
-        tweetText: (await latestTweet.locator('[data-testid="tweetText"]').first().textContent() || '').trim(),
-        tweetUrl: tweetUrl,
-        tweetTimestamp: await latestTweet.locator('time').first().getAttribute('datetime'),
-        tweetImageUrl: null,
-        profilePicUrl: await page.locator(`a[href="/${handle}/photo"] img`).getAttribute('src'),
-    };
-    const imageElement = latestTweet.locator('[data-testid="tweetPhoto"] img');
-    if (await imageElement.count() > 0) {
-      tweetData.tweetImageUrl = await imageElement.first().getAttribute('src');
-    }
-    
+
+    console.log('\n' + '='.repeat(60));
+    console.log('🆕 NEW TWEET DETECTED!');
+    console.log('='.repeat(60));
+    console.log(`👤 Author: ${tweetData.authorName} (${tweetData.authorHandle})`);
+    console.log(`📝 Text: ${tweetData.tweetText.substring(0, 200)}${tweetData.tweetText.length > 200 ? '...' : ''}`);
+    console.log(`🔗 URL: ${tweetData.tweetUrl}`);
+    console.log(`🖼️  Image: ${tweetData.tweetImageUrl ? 'Yes' : 'No'}`);
+    console.log('='.repeat(60));
+
+    // Send to Discord
     await sendToDiscord(tweetData);
 
-    console.log(`Updating log file for @${handle} with new URL: ${tweetData.tweetUrl}`);
+    // Update log file
+    console.log(`\n💾 Updating log file...`);
     await fs.mkdir(path.dirname(logFilePath), { recursive: true });
     await fs.writeFile(logFilePath, tweetData.tweetUrl);
 
+    console.log('\n✅ DONE!\n');
+
   } catch (error) {
-    console.error(`An error occurred for handle @${handle}:`, error);
-    await page.screenshot({ path: `error_${handle}.png` });
-  } finally {
-    await browser.close();
-    console.log('Browser closed.');
+    console.error(`\n${'='.repeat(60)}`);
+    console.error(`❌ ERROR for @${handle}`);
+    console.error(`${'='.repeat(60)}`);
+    console.error(error.message);
+    console.error('='.repeat(60) + '\n');
+    process.exit(1);
   }
 }
 
-
 main();
-
-
-

@@ -24,20 +24,17 @@ jobs:
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
-          # The directory where playwright stores its browsers
           path: ~/.cache/ms-playwright
-          # The key to identify the cache. It's based on the OS and a hash of your package-lock.json.
-          # If package-lock.json changes, a new cache is created.
           key: ${{ runner.os }}-playwright-browsers-${{ hashFiles('**/package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-playwright-browsers-
-      
+
       - name: Install Playwright Browsers
-        run: npx playwright install --with-deps
-      - name: Run Tweet Scraper for Manual Input
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Lookout for Manual Input
         run: node scraper.js ${{ github.event.inputs.twitter_handle }}
         env:
-          AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
       - name: Commit and Push Log Files
         run: |
@@ -45,3 +42,4 @@ jobs:
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           git add log/
           git diff --staged --quiet || (git commit -m "Update tweet logs" && git push)
+

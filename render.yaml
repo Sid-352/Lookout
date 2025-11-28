@@ -1,0 +1,22 @@
+# render.yaml - Render.com Blueprint for Nitter
+
+services:
+  # Redis for Nitter caching
+  - type: redis
+    name: nitter-redis
+    plan: free
+    maxmemoryPolicy: noeviction
+    ipAllowList: []
+
+  # Nitter web service
+  - type: web
+    name: nitter
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: REDIS_HOST
+        fromService:
+          name: nitter-redis
+          type: redis
+          property: host
